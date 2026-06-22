@@ -446,6 +446,642 @@
     // === MQTT CONNECTION ===
     function MQTTConnect() {
       var cid = "WebClient-" + Math.random().toString(16).substr(2, 8);
+      // PERBAIKAN 1: Port diubah menjadi 8884
+      mqttClient = new Paho.MQTT.Client("broker.hivemq.com", 8884, cid);
+      
+      mqttClient.onConnectionLost = (r) => { 
+        document.getElementById('koneksi-status').innerHTML = "TERPUTUS. RECONNECT..."; 
+        document.getElementById('koneksi-status').style.color = "#f1c40f"; 
+        setTimeout(MQTTConnect, 3000); 
+      };
+      
+      mqttClient.onMessageArrived = onMessageArrived;
+      
+      mqttClient.connect({ 
+        // PERBAIKAN 2: Mengaktifkan opsi Secure WebSocket (WSS/HTTPS)
+        useSSL: true, 
+        onSuccess: () => {
+          document.getElementById('koneksi-status').innerHTML = "TERHUBUNG KE HIVEMQ CLOUD"; document.getElementById('koneksi-status').style.color = "#2ecc71";
+          document.getElementById('pos_btn').style.pointerEvents = "auto"; document.getElementById('spd_btn').style.pointerEvents = "auto";
+          document.getElementById('pos_btn_update').style.pointerEvents = "auto"; document.getElementById('pos_btn_update').style.opacity = "1";
+          document.getElementById('spd_btn_update').style.pointerEvents = "auto"; document.getElementById('spd_btn_update').style.opacity = "1";
+          mqttClient.subscribe(topic_pos_data);
+          mqttClient.subscribe(topic_spd_data);
+        }
+      });
+    }
+
+    function sendMQTT(topic, msg) { var m = new Paho.MQTT.Message(msg); m.destinationName = topic; mqttClient.send(m); }
+
+    // === MESSAGE HANDLER ROUTER ===
+    function onMessageArrived(message) {
+      if (message.destinationName === topic_pos_data) handlePosisiData(message.payloadString);
+      else if (message.destinationName === topic_spd_data) handleSpeedData(message.payloadString);
+    }
+
+    // === FUNGSI RESET TITIK 0 BARU ===
+    function resetTitikNolPosisi() {
+        pos_offset = currentPosRaw; 
+        document.getElementById('txt-posisi').innerHTML = "0";
+        posChart.data.labels = []; 
+        posChart.data.datasets[0].data = []; 
+        posChart.data.datasets[1].data = [];
+        posChart.update();
+    }
+
+    // === LOGIKA POSISI ===
+    function changeModePos() {
+        pos_isFreeMode = (document.getElementById("pos_modeSelect").value === "bebas");
+        document.getElementById("pos_analisis_metrics").style.display = pos_isFreeMode ? "none" : "block";
+    }
+
+    function handlePosisiData(payload) {
+      var arr = payload.split(','); if(arr.length < 3) return;
+      
+      // Mencegah error jika sewaktu-waktu ESP32 mengirim data tidak sempurna (NaN fallback)
+      currentPosRaw = parseInt(arr[0]) || 0; 
+      var currentPos = currentPosRaw - pos_offset; 
+      var sisa = parseInt(arr[1]) || 0; 
+      var statRaw = arr[2] || "STOP";
+      
+      // TAMBAHAN LOGIKA BACA PWM (Membaca data koma ke-4 dari payload ESP32 jika ada)
+      var posPwm = arr[3] || 0; 
+      
+      pos_currentState = (statRaw === "BERGERAK") ? "START" : "STOP";
+      pos_globalSP = currentPos + sisa; 
+      pos_actual = currentPos;
+      
+      document.getElementById('pos_state').innerHTML = statRaw; 
+      document.getElementById('txt-posisi').innerHTML = currentPos;
+      
+      // TAMBAHAN TAMPILAN PWM
+      document.getElementById('txt-pos-pwm').innerHTML = posPwm;
+      
+      document.getElementById('pos_esp_status').innerText = "ONLINE"; document.getElementById('pos_esp_status').style.color = "#2ecc71";
+      clearTimeout(posWatchdog); posWatchdog = setTimeout(() => { document.getElementById('pos_esp_status').innerText = "OFFLINE"; document.getElementById('pos_esp_status').style.color = "#e74c3c"; }, 4000);
+
+      var btn = document.getElementById('pos_btn');
+      if(pos_currentState == 'START') { btn.innerHTML = 'STOP'; btn.style.background = '#e74c3c'; document.getElementById('pos_state').style.color = '#2ecc71'; } 
+      else { btn.innerHTML = 'START'; btn.style.background = '#27ae60'; document.getElementById('pos_state').style.color = '#e74c3c'; }
+
+      if(pos_currentState == 'START' && pos_previousState == 'STOP') {
+          if (!pos_isFreeMode && !pos_isAnalyzing) {
+              pos_isAnalyzing = true; pos_sysStartTime = Date.now(); pos_currentT = 0.0; pos_lastMoveTime = 0.0; pos_startPos = pos_actual;
+              posChart.data.labels = []; posChart.data.datasets[0].data = []; posChart.data.datasets[1].data = [];
+              p_delay = null; p_rise = null; p_peak = null; p_settle = null; p_steady = null; pos_peak = 0; pos_steadyStr = "Steady State";
+              document.getElementById('pos_val_td').innerText = "-"; document.getElementById('pos_val_rt').innerText = "Menghitung..."; document.getElementById('pos_val_st').innerText = "-";
+          }
+      }
+
+      if (pos_isAnalyzing) {
+          pos_currentT = (Date.now() - pos_sysStartTime) / 1000.0;
+          if (pos_currentState === 'START') pos_lastMoveTime = pos_currentT; 
+      } else if (pos_isFreeMode) { pos_currentT = (Date.now() - pos_sysStartTime) / 1000.0; }
+      
+      pos_previousState = pos_currentState;
+
+      if(pos_isFreeMode || pos_isAnalyzing) {
+        if(posChart.data.labels.length > 800) { posChart.data.labels.shift(); posChart.data.datasets[0].data.shift(); posChart.data.datasets[1].data.shift(); }
+        var tStr = pos_currentT.toFixed(1);
+        posChart.data.labels.push(tStr); posChart.data.datasets[0].data.push(currentPos); posChart.data.datasets[1].data.push(pos_globalSP);
+
+        if (!pos_isFreeMode) {
+            let totalDist = pos_globalSP - pos_startPos; let distMoved = currentPos - pos_startPos;
+            if (Math.abs(totalDist) > 0) {
+                let progress = distMoved / totalDist; 
+                if (p_delay === null && progress >= 0.5) { p_delay = tStr; document.getElementById('pos_val_td').innerText = p_delay + " s"; }
+                if (p_rise === null && progress >= 0.9) { p_rise = tStr; document.getElementById('pos_val_rt').innerText = p_rise + " s"; }
+                if (progress > 1.0 && pos_currentState === 'START') { 
+                    let os = Math.abs(currentPos - pos_globalSP);
+                    if (os > pos_peak) { pos_peak = os; p_peak = tStr; document.getElementById('pos_val_os').innerText = p_peak + " s"; }
+                }
+            }
+
+            if (pos_currentState === 'STOP') {
+                var timeLeft = 10.0 - (pos_currentT - pos_lastMoveTime);
+                if (timeLeft <= 0) {
+                    p_settle = pos_lastMoveTime.toFixed(1);
+                    if (p_peak !== null && parseFloat(p_settle) <= parseFloat(p_peak)) {
+                        p_settle = (parseFloat(p_peak) + 0.1).toFixed(1);
+                    } else if (p_rise !== null && parseFloat(p_settle) <= parseFloat(p_rise)) {
+                        p_settle = (parseFloat(p_rise) + 0.1).toFixed(1);
+                    }
+                    
+                    document.getElementById('pos_val_st').innerText = p_settle + " s";
+                    if (p_peak === null) document.getElementById('pos_val_os').innerText = "0 s";
+                    
+                    let err = Math.abs(pos_actual - pos_globalSP);
+                    let pErr = (Math.abs(pos_globalSP) > 0) ? (err / Math.abs(pos_globalSP) * 100) : 0;
+                    p_steady = tStr; 
+                    pos_steadyStr = "SSE: " + err + " Pulsa (" + pErr.toFixed(2) + "%)";
+                    
+                    triggerStopPos(Math.abs(pos_globalSP) * 0.005);
+                    pos_isAnalyzing = false;
+                } else { 
+                    document.getElementById('pos_val_ss').innerText = "Observasi: " + timeLeft.toFixed(1) + "s"; 
+                    document.getElementById('pos_val_ss').style.color = "#f1c40f"; 
+                }
+            } else { 
+                document.getElementById('pos_val_ss').innerText = "Bergerak..."; 
+                document.getElementById('pos_val_ss').style.color = "#f1c40f"; 
+            }
+
+            if (pos_currentT >= 80.0 && pos_currentState === 'START') {
+                let err = Math.abs(pos_actual - pos_globalSP);
+                let pErr = (Math.abs(pos_globalSP) > 0) ? (err / Math.abs(pos_globalSP) * 100) : 0;
+                p_steady = tStr; 
+                pos_steadyStr = "Timeout (80s) | SSE: " + err + " Pulsa (" + pErr.toFixed(2) + "%)"; 
+                triggerStopPos(Math.abs(pos_globalSP) * 0.005); 
+                pos_isAnalyzing = false; 
+            }
+        }
+        posChart.update();
+      }
+    }
+
+    function triggerStopPos(tol) {
+        document.getElementById('pos_val_ss').innerText = "Selesai!"; 
+        document.getElementById('pos_val_ss').style.color = "#2ecc71";
+        
+        let err = Math.abs(pos_actual - pos_globalSP);
+        let percentErr = 0;
+        if (Math.abs(pos_globalSP) > 0) percentErr = (err / Math.abs(pos_globalSP)) * 100;
+
+        let statusText = ""; let color = "";
+        if (percentErr <= 0.5 || err <= 2) { 
+            statusText = "Stabil (Masuk 0.5%) | SSE: " + err + " Pulsa (" + percentErr.toFixed(2) + "%)";
+            color = "#2ecc71";
+        } else if (pos_actual < pos_globalSP) { 
+            statusText = "Kurang (Tidak Masuk 0.5%) | SSE: " + err + " Pulsa (" + percentErr.toFixed(2) + "%)";
+            color = "#e74c3c";
+        } else { 
+            statusText = "Lebih (Tidak Masuk 0.5%) | SSE: " + err + " Pulsa (" + percentErr.toFixed(2) + "%)";
+            color = "#f1c40f";
+        }
+        
+        document.getElementById('pos_val_stab').innerText = statusText; 
+        document.getElementById('pos_val_stab').style.color = color;
+        sendTuningPosAuto(pos_actual);
+    }
+
+    function sendTuningPosAuto(act) {
+        var act_raw = act + pos_offset; 
+        sendMQTT(topic_pos_ctrl, `${act_raw},${document.getElementById('pos_kp').value},${document.getElementById('pos_ki').value},${document.getElementById('pos_kd').value},${document.getElementById('pos_min').value},${document.getElementById('pos_max').value},${document.getElementById('pos_aw').value}`);
+    }
+    
+    function sendTuningPos() {
+        localStorage.setItem('p_sp', document.getElementById('pos_sp').value); localStorage.setItem('p_kp', document.getElementById('pos_kp').value);
+        localStorage.setItem('p_ki', document.getElementById('pos_ki').value); localStorage.setItem('p_kd', document.getElementById('pos_kd').value);
+        localStorage.setItem('p_min', document.getElementById('pos_min').value); localStorage.setItem('p_max', document.getElementById('pos_max').value);
+        localStorage.setItem('p_aw', document.getElementById('pos_aw').value);
+        
+        var sp_raw = parseInt(document.getElementById('pos_sp').value) + pos_offset;
+        sendMQTT(topic_pos_ctrl, `${sp_raw},${document.getElementById('pos_kp').value},${document.getElementById('pos_ki').value},${document.getElementById('pos_kd').value},${document.getElementById('pos_min').value},${document.getElementById('pos_max').value},${document.getElementById('pos_aw').value}`);
+    }
+    function togglePos() { if(pos_currentState == "START") sendTuningPosAuto(pos_actual); else sendTuningPos(); }
+
+    // === LOGIKA KECEPATAN ===
+    function changeModeSpd() {
+        spd_isFreeMode = (document.getElementById("spd_modeSelect").value === "bebas");
+        document.getElementById("spd_analisis_metrics").style.display = spd_isFreeMode ? "none" : "block";
+    }
+
+    function handleSpeedData(payload) {
+      var data; try { data = JSON.parse(payload); } catch(e) { return; }
+      
+      // Fallback pencegahan error apabila ESP32 sempat mengirim payload kosong
+      spd_currentState = data.status || "STOP"; 
+      var currRpm = parseFloat(data.rpm) || 0.0; 
+      var currSp = parseFloat(data.sp) || 0.0; 
+      var currT = parseFloat(data.t) || 0.0;
+
+      // TAMBAHAN LOGIKA BACA PWM KECEPATAN (Membaca json.pwm)
+      var currPwm = data.pwm || 0;
+      
+      document.getElementById('spd_state').innerHTML = spd_currentState; 
+      document.getElementById('txt-rpm').innerHTML = currRpm.toFixed(1);
+
+      // TAMBAHAN TAMPILAN PWM
+      document.getElementById('txt-spd-pwm').innerHTML = currPwm;
+
+      document.getElementById('spd_esp_status').innerText = "ONLINE"; document.getElementById('spd_esp_status').style.color = "#2ecc71";
+      clearTimeout(spdWatchdog); spdWatchdog = setTimeout(() => { document.getElementById('spd_esp_status').innerText = "OFFLINE"; document.getElementById('spd_esp_status').style.color = "#e74c3c"; }, 4000);
+
+      var btn = document.getElementById('spd_btn');
+      if(spd_currentState == 'START') { btn.innerHTML = 'STOP'; btn.style.background = '#e74c3c'; document.getElementById('spd_state').style.color = '#2ecc71'; } 
+      else { btn.innerHTML = 'START'; btn.style.background = '#27ae60'; document.getElementById('spd_state').style.color = '#e74c3c'; }
+
+      if(spd_currentState == 'START' && spd_previousState == 'STOP') {
+          spdChart.data.labels = []; spdChart.data.datasets[0].data = []; spdChart.data.datasets[1].data = [];
+          s_delay = null; s_rise = null; s_peak = null; s_settle = null; s_steady = null;
+          temp_s_90 = null; temp_s_100 = null; spd_steadyStr = "Steady State";
+          spd_pidStage = 0; spd_peakRpm = 0; spd_steadyStartTime = 0; spd_stopCommandSent = false;
+          
+          document.getElementById('spd_val_td').innerText = "-"; document.getElementById('spd_val_rt').innerText = "-";
+          document.getElementById('spd_val_st').innerText = "-"; document.getElementById('spd_val_os').innerText = "-";
+          document.getElementById('spd_val_stab').innerText = "Menunggu..."; document.getElementById('spd_val_stab').style.color = "#bdc3c7";
+      }
+      spd_previousState = spd_currentState;
+
+      if(spd_currentState == 'START') {
+        if(spdChart.data.labels.length > 600) { spdChart.data.labels.shift(); spdChart.data.datasets[0].data.shift(); spdChart.data.datasets[1].data.shift(); }
+        var tStr = currT.toFixed(1);
+        spdChart.data.labels.push(tStr); spdChart.data.datasets[0].data.push(currRpm); spdChart.data.datasets[1].data.push(currSp);
+
+        if (!spd_isFreeMode) {
+            if (s_delay === null && currRpm >= (currSp * 0.5) && currSp > 0) { s_delay = tStr; document.getElementById('spd_val_td').innerText = s_delay + " s"; }
+            if (spd_pidStage === 0 && currRpm >= (currSp * 0.9) && currSp > 0) { temp_s_90 = tStr; document.getElementById('spd_val_ss').innerText = "Mendekati SP..."; spd_pidStage = 0.5; }
+            if (spd_pidStage === 0.5 && currRpm >= (currSp - 0.5)) { temp_s_100 = tStr; s_rise = temp_s_100; document.getElementById('spd_val_rt').innerText = s_rise + " s"; document.getElementById('spd_val_ss').innerText = "Mencari Puncak..."; spd_pidStage = 1; spd_peakRpm = currRpm; }
+
+            if (spd_pidStage === 1 && currT < 50.0) {
+                if (currRpm > spd_peakRpm) { spd_peakRpm = currRpm; s_peak = tStr; document.getElementById('spd_val_os').innerText = s_peak + " s"; }
+                if (spd_peakRpm > currSp + 0.5) {
+                    if (currRpm <= currSp + 0.5) { s_settle = tStr; document.getElementById('spd_val_st').innerText = s_settle + " s"; s_steady = tStr; spd_steadyStartTime = currT; spd_pidStage = 2; }
+                }
+            }
+
+            if (spd_pidStage === 2 && !spd_stopCommandSent && currT < 50.0) {
+                var timeLeft = 20.0 - (currT - spd_steadyStartTime);
+                if (timeLeft <= 0) {
+                    spd_stopCommandSent = true; spd_pidStage = 3; document.getElementById('spd_val_ss').innerText = "Selesai! (Auto-Stop)"; document.getElementById('spd_val_ss').style.color = "#2ecc71";
+                    evalSpd(currRpm, currSp); sendMQTT(topic_spd_ctrl, "ACTION=STOP");
+                } else { document.getElementById('spd_val_ss').innerText = "Steady! Stop dlm " + timeLeft.toFixed(1) + "s"; document.getElementById('spd_val_ss').style.color = "#f1c40f"; }
+            }
+
+            if (currT >= 50.0 && !spd_stopCommandSent && spd_pidStage < 3) {
+                if (spd_pidStage < 1) { 
+                    s_steady = tStr; spd_steadyStr = "SS Error"; document.getElementById('spd_val_os').innerText = "0 s";
+                } else if (spd_pidStage < 2 || spd_peakRpm <= currSp + 0.5) {
+                    s_peak = null; document.getElementById('spd_val_os').innerText = "0 s"; 
+                    s_rise = temp_s_90; document.getElementById('spd_val_rt').innerText = s_rise + " s";
+                    s_settle = temp_s_100; document.getElementById('spd_val_st').innerText = s_settle + " s"; s_steady = tStr; spd_steadyStr = "Steady State";
+                }
+                spd_stopCommandSent = true; spd_pidStage = 3; document.getElementById('spd_val_ss').innerText = "Selesai! (Timeout 50s)";
+                evalSpd(currRpm, currSp); sendMQTT(topic_spd_ctrl, "ACTION=STOP");
+            }
+        }
+        spdChart.update();
+      }
+    }
+
+    function evalSpd(rpm, sp) {
+        if (spd_peakRpm < sp) { document.getElementById('spd_val_stab').innerText = "Steady State Error (SSE)"; document.getElementById('spd_val_stab').style.color = "#e74c3c"; } 
+        else if (Math.abs(rpm - sp) <= sp * 0.05) { document.getElementById('spd_val_stab').innerText = "Stabil (Toleransi 5%)"; document.getElementById('spd_val_stab').style.color = "#2ecc71"; } 
+        else { document.getElementById('spd_val_stab').innerText = "Tidak Stabil (Osilasi)"; document.getElementById('spd_val_stab').style.color = "#f1c40f"; }
+    }
+
+    // Fungsi Pengiriman diperbarui dengan Delay Bertahap + Callback
+    function sendTuningSpd(callback) {
+        var sp = document.getElementById('spd_sp').value; var kp = document.getElementById('spd_kp').value;
+        var ki = document.getElementById('spd_ki').value; var kd = document.getElementById('spd_kd').value;
+        var aw = document.getElementById('spd_aw').value;
+        var fe = document.getElementById('spd_filter_en').value; var al = document.getElementById('spd_alpha').value;
+        
+        localStorage.setItem('s_sp', sp); localStorage.setItem('s_kp', kp); localStorage.setItem('s_ki', ki);
+        localStorage.setItem('s_kd', kd); localStorage.setItem('s_aw', aw); localStorage.setItem('s_f_en', fe); 
+        localStorage.setItem('s_alp', al);
+        
+        // Timeout bertingkat agar broker HiveMQ tidak mengabaikan pesan massal
+        setTimeout(() => sendMQTT(topic_spd_ctrl, "SP=" + sp), 0);
+        setTimeout(() => sendMQTT(topic_spd_ctrl, "KP=" + kp), 50);
+        setTimeout(() => sendMQTT(topic_spd_ctrl, "KI=" + ki), 100);
+        setTimeout(() => sendMQTT(topic_spd_ctrl, "KD=" + kd), 150);
+        setTimeout(() => sendMQTT(topic_spd_ctrl, "ANTI_WINDUP=" + aw), 200);
+        setTimeout(() => sendMQTT(topic_spd_ctrl, "FILTER_EN=" + fe), 250);
+        setTimeout(() => { 
+            sendMQTT(topic_spd_ctrl, "ALPHA=" + al); 
+            if (typeof callback === "function") callback();
+        }, 300);
+    }
+    
+    // Perubahan Logika Toggle: Pastikan param terkirim utuh SEBELUM menyuruh Start
+    function toggleSpd() { 
+        if (spd_currentState == "START") {
+            sendMQTT(topic_spd_ctrl, "ACTION=STOP"); 
+        } else {
+            sendTuningSpd(function() {
+                setTimeout(() => sendMQTT(topic_spd_ctrl, "ACTION=START"), 50);
+            });
+        }
+    }
+  </script> 
+</body> 
+</html>
+        <div style="font-size:14px; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #7f8c8d;">Sinyal ESP32: <strong id="spd_esp_status" style="color:#e74c3c;">TIDAK ADA DATA</strong></div>
+        <div style="font-size:14px; color:#bdc3c7;">Kecepatan (RPM)</div>
+        <div class="nilai-display"><span id="txt-rpm">0.0</span></div>
+
+        <div style="font-size:14px; color:#bdc3c7; margin-top: 15px;">Output PWM</div>
+        <div class="nilai-display" style="font-size: 35px; color: #3498db; text-shadow: 0 0 10px rgba(52, 152, 219, 0.4);"><span id="txt-spd-pwm">0</span></div>
+        <div class="btn-circle" id="spd_btn" onclick="toggleSpd()">...</div> 
+      </div>
+
+      <div class="panel" style="text-align: left;">
+        <h3 style="margin-top: 0; text-align: center; color: #ecf0f1;">Tuning Parameter</h3>
+        <div class="tuning-row"><label>Set Point (RPM):</label> <input type="number" id="spd_sp" value="110" step="1"></div>
+        <div class="tuning-row"><label>Kp (Proportional):</label> <input type="number" id="spd_kp" value="2.0" step="0.1"></div>
+        <div class="tuning-row"><label>Ki (Integral):</label> <input type="number" id="spd_ki" value="0.1" step="0.01"></div>
+        <div class="tuning-row"><label>Kd (Derivative):</label> <input type="number" id="spd_kd" value="0.1" step="0.01"></div>
+        <div class="tuning-row">
+            <label style="color:#1abc9c;">Anti-Windup:</label> 
+            <select id="spd_aw" style="border-color:#1abc9c; color:#1abc9c;">
+                <option value="1">1 - Aktif</option>
+                <option value="0">0 - Non-Aktif</option>
+            </select>
+        </div>
+        <div style="border-top: 1px dashed #7f8c8d; margin: 10px 0; padding-top: 5px;"></div>
+        <div class="tuning-row">
+            <label style="color:#e67e22;">Filter Digital (EMA):</label> 
+            <select id="spd_filter_en" style="border-color:#e67e22; color:#e67e22;">
+                <option value="1">1 - Aktif</option>
+                <option value="0">0 - Non-Aktif</option>
+            </select>
+        </div>
+        <div class="tuning-row"><label>Nilai Alpha (Filter):</label> <input type="number" id="spd_alpha" value="0.2" step="0.05"></div>
+        <button class="update-btn" id="spd_btn_update" onclick="sendTuningSpd()">Update ke ESP32</button>
+      </div>
+
+      <div class="panel" style="text-align: left;">
+        <h3 style="margin-top: 0; text-align: center; color: #ecf0f1;">Analisis Respon</h3>
+        <div class="tuning-row" style="border-bottom: 1px solid #7f8c8d; padding-bottom: 10px; margin-bottom: 10px;">
+          <label style="color:#f1c40f;">Mode Operasi:</label> 
+          <select id="spd_modeSelect" onchange="changeModeSpd()">
+            <option value="analisis">Analisis (Auto-Stop)</option>
+            <option value="bebas">Bebas (Continue)</option>
+          </select>
+        </div>
+        <div id="spd_analisis_metrics">
+          <div class="tuning-row"><label>Waktu Tunda (Delay):</label> <strong id="spd_val_td" style="color:#9b59b6;">-</strong></div>
+          <div class="tuning-row"><label>Rise Time (Kenaikan):</label> <strong id="spd_val_rt" style="color:#3498db;">-</strong></div>
+          <div class="tuning-row"><label>Waktu Overshoot:</label> <strong id="spd_val_os" style="color:#e74c3c;">-</strong></div>
+          <div class="tuning-row"><label>Settling Time (Kembali):</label> <strong id="spd_val_st" style="color:#2ecc71;">-</strong></div>
+          <div class="tuning-row"><label>Kestabilan Akhir:</label> <strong id="spd_val_stab" style="color:#bdc3c7;">Menunggu...</strong></div>
+        </div>
+        <div class="tuning-row"><label>Status Sistem:</label> <strong id="spd_val_ss" style="color:#f1c40f;">Menunggu Set Point...</strong></div>
+        <div id="spd_auto_stop_note" style="font-size: 11px; color: #95a5a6; margin-top: 10px; text-align: center;">
+          *Steady State normal otomatis STOP setelah 20s.
+        </div>
+      </div>
+
+      <div class="panel chart-panel"><canvas id="spdChart"></canvas></div>
+    </div>
+  </div>
+
+  <div id="Analisis_Speed" class="tabcontent">
+    <h1 style="margin-top: 0;">Analisis Matematika & Filter</h1>
+    <div class="analysis-box">
+      <h2 style="color: #2980b9; border-bottom: 2px solid #2980b9; padding-bottom: 10px; margin-top: 0;">1. Kendali PID (Proportional-Integral-Derivative)</h2>
+      <p>Sistem kendali PID menghitung nilai output berdasarkan error $e(t)$, yaitu selisih antara Set Point yang diinginkan dan RPM aktual mesin.</p>
+      
+      <div class="formula-display">
+        \[ u(t) = K_p e(t) + K_i \int_{0}^{t} e(\tau) d\tau + K_d \frac{de(t)}{dt} \]
+      </div>
+
+      <p>Berdasarkan input pada Dashboard, perhitungan yang diterapkan adalah:</p>
+      <ul>
+        <li><strong>Aksi Proportional ($K_p$ = <span id="ana_kp" style="color: #e67e22; font-weight: bold;">2.0</span>):</strong> Memberikan respon koreksi yang sebanding dengan besaran error saat ini.</li>
+        <li><strong>Aksi Integral ($K_i$ = <span id="ana_ki" style="color: #e67e22; font-weight: bold;">0.1</span>):</strong> Menjumlahkan error dari waktu ke waktu untuk menghilangkan steady-state error (kesalahan statis).</li>
+        <li><strong>Aksi Derivative ($K_d$ = <span id="ana_kd" style="color: #e67e22; font-weight: bold;">0.1</span>):</strong> Memprediksi laju perubahan error untuk meredam lonjakan (overshoot) dan menstabilkan osilasi.</li>
+      </ul>
+
+      <div class="sim-box">
+        <div style="text-align: center; font-weight: bold; margin-bottom: 10px; font-size: 16px;">Penyederhanaan Logika PID Terhadap Grafik:</div>
+        Output PWM $=$ (<span id="ana_kp_sim" style="font-weight:bold;">2.0</span> $\times$ Error) $+$ (<span id="ana_ki_sim" style="font-weight:bold;">0.1</span> $\times$ Akumulasi Error) $+$ (<span id="ana_kd_sim" style="font-weight:bold;">0.1</span> $\times$ Laju Perubahan Error)
+        <br><br>
+        <ul style="margin:0; padding-left: 20px;">
+          <li><b>Ketika grafik RPM jauh di bawah Set Point (Delay & Rise Time):</b> Error sangat besar, sehingga nilai Proportional akan merespon dengan mendorong motor sekencang mungkin ke atas.</li>
+          <li><b>Ketika grafik tertahan di bawah Set Point (Steady State Error):</b> Nilai Integral akan terus mengakumulasi dorongan perlahan-lahan sampai grafik menyentuh Set Point.</li>
+          <li><b>Ketika grafik melesat tajam ke atas (Mencegah Overshoot):</b> Nilai Derivative membaca grafik yang naik terlalu cepat, sehingga ia akan "mengerem" dorongan agar grafik tidak kebablasan melebihi garis hijau.</li>
+        </ul>
+      </div>
+
+      <h3 style="color: #2980b9; margin-top: 25px; border-bottom: 1px dashed #2980b9; padding-bottom: 5px;">Fenomena Integral Windup & Anti-Windup Kecepatan</h3>
+      <p><strong>Integral Windup:</strong> Kondisi ketika motor mengalami saturasi beban atau batas tegangan maksimum PWM, tetapi target RPM belum juga tercapai. Akibatnya, nilai Integral terus menjumlahkan error secara ekstrem (tergulung/windup). Begitu RPM menyentuh Set Point, tumpukan error raksasa tersebut tidak bisa langsung hilang sehingga motor terus berputar kencang, memicu lonjakan (*overshoot*) yang parah dan lama.</p>
+      <p><strong>Anti-Windup:</strong> Metode pengaman yang berfungsi mengunci atau menghentikan akumulasi nilai Integral (*clipping/freezing*) sesaat setelah output kendali mencapai batas saturasi maksimum PWM. Dengan membatasi memori error masa lalu ini, grafik RPM dapat segera melambat and kembali turun secara presisi begitu mendekati target tanpa *overshoot* berlebih.</p>
+
+      <h2 style="color: #e67e22; border-bottom: 2px solid #e67e22; padding-bottom: 10px; margin-top: 30px;">2. Karakteristik Respon Sistem</h2>
+      <p>Untuk mengukur seberapa baik sistem kendali bekerja, kita menganalisis bentuk grafik yang dihasilkan menggunakan istilah-istilah berikut:</p>
+      <ul>
+        <li><b>Delay Time (Waktu Tunda):</b> Waktu yang dibutuhkan grafik untuk mencapai <b>50%</b> dari target (Set Point) untuk pertama kalinya sejak mesin dinyalakan.</li>
+        <li><b>Rise Time (Waktu Naik):</b> Waktu yang dibutuhkan grafik untuk melesat naik dan pertama kali menyentuh atau melintasi garis penuh Set Point.</li>
+        <li><b>Overshoot (Lonjakan Maksimum):</b> Kondisi ketika grafik kebablasan melesat naik melewati batas garis Set Point sebelum akhirnya turun kembali. Jika nilainya terlalu tinggi, berarti sistem terlalu agresif.</li>
+        <li><b>Settling Time (Waktu Menetap):</b> Waktu yang dibutuhkan grafik untuk berhenti berosilasi (naik-turun) secara ekstrem dan mulai stabil bertahan di dekat garis Set Point.</li>
+        <li><b>Steady State (Kondisi Tunak):</b> Fase akhir perjalanan grafik di mana kurva kecepatannya sudah mendatar, stabil, dan tidak lagi menunjukkan perubahan besar seiring berjalannya waktu.</li>
+        <li><b>Steady State Error (SSE):</b> Jarak atau selisih antara nilai Set Point dengan posisi grafik saat berada di fase Steady State. Sistem yang sempurna memiliki SSE = 0 (grafik menempel persis pada garis Set Point). Jika grafik mentok mendatar di bawah atau di atas Set Point, jarak itulah yang disebut Steady State Error.</li>
+      </ul>
+
+      <h2 style="color: #27ae60; border-bottom: 2px solid #27ae60; padding-bottom: 10px; margin-top: 30px;">3. Filter Digital (Alpha Filter / EMA)</h2>
+      <p>Untuk menghaluskan pembacaan data RPM dari sensor yang fluktuatif/bergetar, digunakan Exponential Moving Average (EMA).</p>
+      
+      <div class="formula-display">
+        \[ Y_n = \alpha \cdot X_n + (1 - \alpha) \cdot Y_{n-1} \]
+      </div>
+
+      <p><b>Penjelasan Komponen Rumus:</b></p>
+      <ul>
+        <li><b>$Y_n$ (Output Filter Saat Ini):</b> Hasil akhir RPM yang sudah dihaluskan dan siap ditampilkan di grafik/layar Anda.</li>
+        <li><b>$X_n$ (Input Mentah):</b> Nilai RPM asli pembacaan sensor pada detik ini yang mungkin masih melompat-lompat (noise).</li>
+        <li><b>$\alpha$ (Faktor Kepercayaan / Alpha):</b> Persentase seberapa besar kita mengambil data mentah baru. Jika $\alpha = 0.2$, artinya kita hanya mengambil 20% dari data mentah.</li>
+        <li><b>$(1 - \alpha)$ (Sisa Persentase):</b> Jika $\alpha = 0.2$, maka $(1 - 0.2) = \mathbf{0.8}$. Angka 0.8 ini adalah 80% sisa kepercayaan kita yang dipertahankan dari data lama agar grafik tidak tiba-tiba melonjak drastis.</li>
+        <li><b>$Y_{n-1}$ (Output Filter Sebelumnya):</b> Nilai RPM halus dari satu hitungan detik sebelumnya yang disimpan di memori mikrokontroler.</li>
+      </ul>
+      
+      <div class="sim-box" style="text-align: center; font-weight: bold;">
+        Penyederhanaan Logika (Misal $\alpha = 0.2$):<br><br>
+        $Y_{filter} = (<span id="ana_alpha_sim">0.2</span> \times RPM_{mentah}) + ((1 - <span id="ana_alpha_sim2">0.2</span>) \times RPM_{sebelumnya})$
+      </div>
+
+      <h2 style="color: #8e44ad; border-bottom: 2px solid #8e44ad; padding-bottom: 10px; margin-top: 30px;">4. Evaluasi Kestabilan Akhir</h2>
+      <p>Setelah sistem melewati waktu Settling Time atau saat hitung mundur selesai, sistem mengevaluasi keberhasilan target:</p>
+      <ul>
+        <li><b>Steady State Error (SSE):</b> Terjadi jika grafik RPM merata di bawah target dan <b>tidak pernah menyentuh</b> garis Set Point sama sekali.</li>
+        <li><b>Stabil (Toleransi 5%):</b> Terjadi jika grafik berhasil menyentuh Set Point, dan pada titik akhir pengujian, nilai RPM mampu bertahan stabil di dalam batas toleransi $\pm 5\%$ dari Set Point.</li>
+      </ul>
+    </div>
+  </div>
+
+  <script> 
+    // === TAB SYSTEM ===
+    function openTab(evt, tabName) {
+      var i, tabcontent, tablinks;
+      tabcontent = document.getElementsByClassName("tabcontent");
+      for (i = 0; i < tabcontent.length; i++) { tabcontent[i].style.display = "none"; }
+      tablinks = document.getElementsByClassName("tablinks");
+      for (i = 0; i < tablinks.length; i++) { tablinks[i].className = tablinks[i].className.replace(" active", ""); }
+      document.getElementById(tabName).style.display = "block";
+      evt.currentTarget.className += " active";
+      
+      if (tabName === 'Analisis_Speed') syncAnalysisSpd();
+      if (window.MathJax) MathJax.typeset();
+    }
+
+    function syncAnalysisSpd() {
+      var kp_val = document.getElementById('spd_kp').value;
+      var ki_val = document.getElementById('spd_ki').value;
+      var kd_val = document.getElementById('spd_kd').value;
+      var alpha_val = document.getElementById('spd_alpha').value;
+
+      if(document.getElementById('ana_kp')) document.getElementById('ana_kp').innerText = kp_val;
+      if(document.getElementById('ana_ki')) document.getElementById('ana_ki').innerText = ki_val;
+      if(document.getElementById('ana_kd')) document.getElementById('ana_kd').innerText = kd_val;
+
+      if(document.getElementById('ana_kp_sim')) document.getElementById('ana_kp_sim').innerText = kp_val;
+      if(document.getElementById('ana_ki_sim')) document.getElementById('ana_ki_sim').innerText = ki_val;
+      if(document.getElementById('ana_kd_sim')) document.getElementById('ana_kd_sim').innerText = kd_val;
+      if(document.getElementById('ana_alpha_sim')) document.getElementById('ana_alpha_sim').innerText = alpha_val;
+      if(document.getElementById('ana_alpha_sim2')) document.getElementById('ana_alpha_sim2').innerText = alpha_val;
+    }
+
+    // === GLOBAL MQTT & WATCHDOG ===
+    var mqttClient;
+    var posWatchdog, spdWatchdog;
+    var topic_pos_data = "robot/motor/status"; 
+    var topic_pos_ctrl = "robot/motor/param"; 
+    var topic_spd_data = "habib/pid/data_motor";
+    var topic_spd_ctrl = "habib/pid/kontrol_motor";
+
+    // === VARIABEL POSISI ===
+    var pos_offset = 0;         
+    var currentPosRaw = 0;      
+    var posChart;
+    var pos_currentState = "STOP", pos_previousState = "STOP";
+    var pos_isFreeMode = false, pos_isAnalyzing = false;
+    var pos_sysStartTime = Date.now(), pos_currentT = 0.0, pos_lastMoveTime = 0.0;
+    var pos_actual = 0, pos_globalSP = 1600, pos_startPos = 0, pos_peak = 0;
+    var p_delay = null, p_rise = null, p_peak = null, p_settle = null, p_steady = null;
+    var pos_steadyStr = "Steady State";
+
+    // === VARIABEL KECEPATAN ===
+    var spdChart;
+    var spd_currentState = "STOP", spd_previousState = "STOP";
+    var spd_isFreeMode = false;
+    var s_delay = null, s_rise = null, s_peak = null, s_settle = null, s_steady = null;
+    var temp_s_90 = null, temp_s_100 = null;
+    var spd_steadyStr = "Steady State";
+    var spd_pidStage = 0, spd_peakRpm = 0, spd_steadyStartTime = 0;
+    var spd_stopCommandSent = false;
+
+    // === LOAD LOCAL STORAGE ===
+    document.addEventListener('DOMContentLoaded', function() {
+        // Posisi
+        if(localStorage.getItem('p_sp')) document.getElementById('pos_sp').value = localStorage.getItem('p_sp');
+        if(localStorage.getItem('p_kp')) document.getElementById('pos_kp').value = localStorage.getItem('p_kp');
+        if(localStorage.getItem('p_ki')) document.getElementById('pos_ki').value = localStorage.getItem('p_ki');
+        if(localStorage.getItem('p_kd')) document.getElementById('pos_kd').value = localStorage.getItem('p_kd');
+        if(localStorage.getItem('p_min')) document.getElementById('pos_min').value = localStorage.getItem('p_min');
+        if(localStorage.getItem('p_max')) document.getElementById('pos_max').value = localStorage.getItem('p_max');
+        if(localStorage.getItem('p_aw')) document.getElementById('pos_aw').value = localStorage.getItem('p_aw');
+        // Kecepatan
+        if(localStorage.getItem('s_sp')) document.getElementById('spd_sp').value = localStorage.getItem('s_sp');
+        if(localStorage.getItem('s_kp')) document.getElementById('spd_kp').value = localStorage.getItem('s_kp');
+        if(localStorage.getItem('s_ki')) document.getElementById('spd_ki').value = localStorage.getItem('s_ki');
+        if(localStorage.getItem('s_kd')) document.getElementById('spd_kd').value = localStorage.getItem('s_kd');
+        if(localStorage.getItem('s_aw')) document.getElementById('spd_aw').value = localStorage.getItem('s_aw');
+        if(localStorage.getItem('s_f_en')) document.getElementById('spd_filter_en').value = localStorage.getItem('s_f_en');
+        if(localStorage.getItem('s_alp')) document.getElementById('spd_alpha').value = localStorage.getItem('s_alp');
+        
+        // Input Listeners untuk Sinkronisasi Live pada Analisis Kecepatan
+        document.getElementById('spd_kp').addEventListener('input', syncAnalysisSpd);
+        document.getElementById('spd_ki').addEventListener('input', syncAnalysisSpd);
+        document.getElementById('spd_kd').addEventListener('input', syncAnalysisSpd);
+        document.getElementById('spd_alpha').addEventListener('input', syncAnalysisSpd);
+
+        initCharts(); MQTTConnect();
+        syncAnalysisSpd();
+    });
+
+    // === INIT CHARTS ===
+    function initCharts() {
+      // CHART POSISI
+      posChart = new Chart(document.getElementById('posChart').getContext('2d'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: 'Posisi Aktual', data: [], borderColor: '#f1c40f', backgroundColor: 'rgba(241,196,15,0.1)', borderWidth: 3, pointRadius: 0, fill: true, tension: 0 },
+            { label: 'Set Point', data: [], borderColor: '#2ecc71', borderWidth: 2, borderDash: [5,5], pointRadius: 0, fill: false, tension: 0 }
+        ]},
+        options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { grid: { color: 'rgba(255,255,255,0.1)' }, ticks: { color: '#bdc3c7' } }, x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#bdc3c7', maxTicksLimit: 15 } } }, plugins: { legend: { labels: { color: '#ecf0f1' } } } },
+        plugins: [{
+          id: 'posPlugin',
+          afterDraw: (chart) => {
+            if (pos_isFreeMode) return;
+            const ctx = chart.ctx; const yAxis = chart.scales.y;
+            function drawLine(t_val, color, label, yOff) {
+                if (t_val !== null) {
+                    let idx = chart.data.labels.indexOf(t_val);
+                    if (idx !== -1 && chart.getDatasetMeta(0).data[idx]) {
+                        let x = chart.getDatasetMeta(0).data[idx].x;
+                        ctx.save(); ctx.beginPath(); ctx.moveTo(x, yAxis.top); ctx.lineTo(x, yAxis.bottom); ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.setLineDash([5, 5]); ctx.stroke();
+                        ctx.font = "bold 12px Arial"; let w = ctx.measureText(label).width; let lx = x + 8; if (x > chart.chartArea.right - w - 15) lx = x - w - 8;
+                        ctx.fillStyle = 'rgba(44,62,80,0.9)'; ctx.fillRect(lx - 3, yAxis.top + yOff - 12, w + 10, 18);
+                        ctx.fillStyle = color; ctx.fillText(label, lx + 2, yAxis.top + yOff); ctx.restore();
+                    }
+                }
+            }
+            drawLine(p_delay, '#9b59b6', 'Delay', 5); drawLine(p_rise, '#3498db', 'Rise Time', 25);
+            if(p_peak !== null) drawLine(p_peak, '#e74c3c', 'Overshoot', 45);
+            drawLine(p_settle, '#2ecc71', 'Settling', 65);
+            if (p_steady !== null) {
+                let idx = chart.data.labels.indexOf(p_steady);
+                if (idx !== -1 && chart.getDatasetMeta(0).data[idx] && chart.getDatasetMeta(1).data[idx]) {
+                    let x = chart.getDatasetMeta(0).data[idx].x; let ySP = chart.getDatasetMeta(1).data[idx].y;
+                    ctx.save(); ctx.font = "bold 12px Arial"; let w = ctx.measureText(pos_steadyStr).width; let lx = x + 8; if (x > chart.chartArea.right - w - 15) lx = x - w - 8;
+                    let color = pos_steadyStr.includes("Tidak Masuk") ? '#e74c3c' : '#f1c40f'; // Penanda visual warna label
+                    if (pos_steadyStr.includes("Masuk 0.5%")) color = '#2ecc71';
+                    ctx.fillStyle = 'rgba(44,62,80,0.9)'; ctx.fillRect(lx - 3, ySP + 25 - 12, w + 10, 18);
+                    ctx.fillStyle = color; ctx.fillText(pos_steadyStr, lx + 2, ySP + 25); ctx.restore();
+                }
+            }
+          }
+        }]
+      });
+
+      // CHART KECEPATAN
+      spdChart = new Chart(document.getElementById('spdChart').getContext('2d'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: 'RPM Aktual', data: [], borderColor: '#f1c40f', backgroundColor: 'rgba(241,196,15,0.1)', borderWidth: 3, pointRadius: 0, fill: true, tension: 0 },
+            { label: 'Set Point', data: [], borderColor: '#2ecc71', borderWidth: 2, borderDash: [5,5], pointRadius: 0, fill: false, tension: 0 }
+        ]},
+        options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true, suggestedMax: 150, grid: { color: 'rgba(255,255,255,0.1)' }, ticks: { color: '#bdc3c7' } }, x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#bdc3c7', maxTicksLimit: 15 } } }, plugins: { legend: { labels: { color: '#ecf0f1' } } } },
+        plugins: [{
+          id: 'spdPlugin',
+          afterDraw: (chart) => {
+            if (spd_isFreeMode) return;
+            const ctx = chart.ctx; const yAxis = chart.scales.y;
+            function drawLine(t_val, color, label, yOff) {
+                if (t_val !== null) {
+                    let idx = chart.data.labels.indexOf(t_val);
+                    if (idx !== -1 && chart.getDatasetMeta(0).data[idx]) {
+                        let x = chart.getDatasetMeta(0).data[idx].x;
+                        ctx.save(); ctx.beginPath(); ctx.moveTo(x, yAxis.top); ctx.lineTo(x, yAxis.bottom); ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.setLineDash([5, 5]); ctx.stroke();
+                        ctx.font = "bold 12px Arial"; let w = ctx.measureText(label).width; let lx = x + 8; if (x > chart.chartArea.right - w - 15) lx = x - w - 8;
+                        ctx.fillStyle = 'rgba(44,62,80,0.9)'; ctx.fillRect(lx - 3, yAxis.top + yOff - 12, w + 10, 18);
+                        ctx.fillStyle = color; ctx.fillText(label, lx + 2, yAxis.top + yOff); ctx.restore();
+                    }
+                }
+            }
+            drawLine(s_delay, '#9b59b6', 'Delay', 5); drawLine(s_rise, '#3498db', 'Rise Time', 25);
+            if (spd_pidStage >= 1 && s_peak !== null) drawLine(s_peak, '#e74c3c', 'Overshoot', 45);
+            drawLine(s_settle, '#2ecc71', 'Settling', 65);
+            
+            if (s_steady !== null) {
+                let idx = chart.data.labels.indexOf(s_steady);
+                if (idx !== -1 && chart.getDatasetMeta(0).data[idx] && chart.getDatasetMeta(1).data[idx]) {
+                    let x = chart.getDatasetMeta(0).data[idx].x; let ySP = chart.getDatasetMeta(1).data[idx].y;
+                    ctx.save(); ctx.font = "bold 12px Arial"; let w = ctx.measureText(spd_steadyStr).width; let lx = x + 8; if (x > chart.chartArea.right - w - 15) lx = x - w - 8;
+                    let color = spd_steadyStr.includes("Error") ? '#e74c3c' : '#f1c40f';
+                    ctx.fillStyle = 'rgba(44,62,80,0.9)'; ctx.fillRect(lx - 3, ySP + 25 - 12, w + 10, 18);
+                    ctx.fillStyle = color; ctx.fillText(spd_steadyStr, lx + 2, ySP + 25); ctx.restore();
+                }
+            }
+          }
+        }]
+      });
+    }
+
+    // === MQTT CONNECTION ===
+    function MQTTConnect() {
+      var cid = "WebClient-" + Math.random().toString(16).substr(2, 8);
       mqttClient = new Paho.MQTT.Client("broker.hivemq.com", 8000, cid);
       mqttClient.onConnectionLost = (r) => { document.getElementById('koneksi-status').innerHTML = "TERPUTUS. RECONNECT..."; document.getElementById('koneksi-status').style.color = "#f1c40f"; setTimeout(MQTTConnect, 3000); };
       mqttClient.onMessageArrived = onMessageArrived;
